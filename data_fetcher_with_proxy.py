@@ -3,7 +3,7 @@
 
 """
 数据获取模块：负责从免费数据源获取A股股票列表和历史K线数据
-增强版：添加请求延迟、重试机制、分批处理和数据缓存
+增强版：添加请求延迟、重试机制、分批处理、数据缓存和代理池支持
 """
 
 import akshare as ak
@@ -18,6 +18,9 @@ from datetime import datetime, timedelta
 import logging
 import requests
 from functools import wraps
+
+# 导入代理池模块
+from proxy_pool import ProxyPool, ProxyRequests
 
 # 配置日志
 logging.basicConfig(
@@ -61,15 +64,18 @@ def retry_decorator(max_retries=3, delay_base=2, delay_randomize=True, exception
     return decorator
 
 class StockDataFetcher:
-    """A股数据获取类（增强版）"""
+    """A股数据获取类（增强版，支持代理池）"""
     
-    def __init__(self, cache_dir=None, request_delay=(1, 3)):
+    def __init__(self, cache_dir=None, request_delay=(1, 3), use_proxy=False, proxy_list=None, proxy_file=None):
         """
         初始化数据获取器
         
         Args:
             cache_dir (str): 缓存目录，默认为当前目录下的cache子目录
             request_delay (tuple): 请求延迟范围（最小值，最大值），单位为秒
+            use_proxy (bool): 是否使用代理池
+            proxy_list (list): 代理列表，格式为 ["http://ip:port", "http://ip:port", ...]
+            proxy_file (str): 代理文件路径，每行一个代理，格式为 "http://ip:port"
         """
         self.today = datetime.now().strftime('%Y%m%d')
         # 计算一年前的日期作为默认起始日期
@@ -90,6 +96,21 @@ class StockDataFetcher:
         
         # 初始化缓存索引
         self.cache_index = self._load_cache_index()
+        
+        # 初始化代理池
+        self.use_proxy = use_proxy
+        if use_proxy:
+            logger.info("初始化代理池...")
+            self.proxy_pool = ProxyPool(proxies=proxy_list, proxy_file=proxy_file)
+            self.proxy_requests = ProxyRequests(self.proxy_pool)
+            
+            # 检查代理可用性
+            available_proxies = self.proxy_pool.check_proxies()
+            logger.info(f"代理池初始化完成，可用代理数: {len(available_proxies)}")
+        else:
+            logger.info("代理池功能已禁用")
+            self.proxy_pool = None
+            self.proxy_requests = None
     
     def _load_cache_index(self):
         """
@@ -234,6 +255,83 @@ class StockDataFetcher:
         logger.debug(f"请求延迟 {delay:.2f} 秒")
         time.sleep(delay)
     
+    def _make_request_with_proxy(self, url, method="GET", **kwargs):
+        """
+        使用代理池发送请求
+        
+        Args:
+            url (str): 请求URL
+            method (str): 请求方法，默认为GET
+            **kwargs: 其他请求参数
+            
+        Returns:
+            requests.Response: 响应对象
+        """
+        if not self.use_proxy or self.proxy_requests is None:
+            # 不使用代理，直接发送请求
+            if method.upper() == "GET":
+                return requests.get(url, **kwargs)
+            elif method.upper() == "POST":
+                return requests.post(url, **kwargs)
+            else:
+                raise ValueError(f"不支持的请求方法: {method}")
+        else:
+            # 使用代理池发送请求
+            if method.upper() == "GET":
+                return self.proxy_requests.get(url, **kwargs)
+            elif method.upper() == "POST":
+                return self.proxy_requests.post(url, **kwargs)
+            else:
+                raise ValueError(f"不支持的请求方法: {method}")
+    
+    # 重写akshare请求方法，使用代理池
+    def _patch_akshare_request(self):
+        """
+        修补akshare的请求方法，使用代理池发送请求
+        
+        注意：这是一个实验性功能，可能会因akshare版本更新而失效
+        """
+        if not self.use_proxy:
+            return
+        
+        try:
+            # 尝试获取akshare的requests模块
+            import akshare.utils.request as ak_request
+            
+            # 保存原始的request函数
+            original_request = ak_request.requests.request
+            
+            # 定义新的request函数
+            def patched_request(method, url, **kwargs):
+                logger.debug(f"使用代理池发送请求: {method} {url}")
+                return self.proxy_requests.request(method, url, **kwargs)
+            
+            # 替换request函数
+            ak_request.requests.request = patched_request
+            logger.info("成功修补akshare请求方法，启用代理池支持")
+            
+            return original_request
+        except Exception as e:
+            logger.warning(f"修补akshare请求方法失败: {str(e)}")
+            return None
+    
+    def _restore_akshare_request(self, original_request):
+        """
+        恢复akshare的原始请求方法
+        
+        Args:
+            original_request: 原始的request函数
+        """
+        if original_request is None:
+            return
+        
+        try:
+            import akshare.utils.request as ak_request
+            ak_request.requests.request = original_request
+            logger.info("已恢复akshare原始请求方法")
+        except Exception as e:
+            logger.warning(f"恢复akshare请求方法失败: {str(e)}")
+    
     @retry_decorator(max_retries=3, delay_base=5)
     def get_stock_list(self, use_cache=True):
         """
@@ -257,7 +355,19 @@ class StockDataFetcher:
         try:
             logger.info("正在获取A股股票列表...")
             self._add_request_delay()  # 添加请求延迟
-            stock_info = ak.stock_info_a_code_name()
+            
+            # 如果启用代理池，修补akshare请求方法
+            original_request = None
+            if self.use_proxy:
+                original_request = self._patch_akshare_request()
+            
+            try:
+                stock_info = ak.stock_info_a_code_name()
+            finally:
+                # 恢复akshare原始请求方法
+                if self.use_proxy and original_request:
+                    self._restore_akshare_request(original_request)
+            
             logger.info(f"成功获取A股股票列表，共{len(stock_info)}支股票")
             
             # 缓存数据（股票列表缓存时间较长，设为30天）
@@ -318,14 +428,24 @@ class StockDataFetcher:
             }
             ak_period = period_map.get(period, 'daily')
             
-            # 获取股票历史数据
-            stock_data = ak.stock_zh_a_hist(
-                symbol=stock_code,
-                period=ak_period,
-                start_date=start_date,
-                end_date=end_date,
-                adjust="qfq"  # 前复权
-            )
+            # 如果启用代理池，修补akshare请求方法
+            original_request = None
+            if self.use_proxy:
+                original_request = self._patch_akshare_request()
+            
+            try:
+                # 获取股票历史数据
+                stock_data = ak.stock_zh_a_hist(
+                    symbol=stock_code,
+                    period=ak_period,
+                    start_date=start_date,
+                    end_date=end_date,
+                    adjust="qfq"  # 前复权
+                )
+            finally:
+                # 恢复akshare原始请求方法
+                if self.use_proxy and original_request:
+                    self._restore_akshare_request(original_request)
             
             logger.info(f"成功获取股票 {stock_code} 的 {period} 数据，共{len(stock_data)}条记录")
             
@@ -428,35 +548,61 @@ class StockDataFetcher:
                 time.sleep(period_delay)
         
         return result
+    
+    def get_proxy_stats(self):
+        """
+        获取代理统计信息
+        
+        Returns:
+            dict: 代理统计信息，如果未启用代理池则返回None
+        """
+        if not self.use_proxy or self.proxy_pool is None:
+            return None
+        
+        return self.proxy_pool.get_proxy_stats()
 
 
 # 测试代码
 if __name__ == "__main__":
-    fetcher = StockDataFetcher(request_delay=(0.5, 1.5))  # 测试时使用较短的延迟
+    # 测试不使用代理池
+    logger.info("=== 测试不使用代理池 ===")
+    fetcher1 = StockDataFetcher(request_delay=(0.5, 1.5), use_proxy=False)
     
     # 清理过期缓存
-    fetcher._clean_expired_cache()
+    fetcher1._clean_expired_cache()
     
     # 获取股票列表
-    stock_list = fetcher.get_stock_list()
+    stock_list = fetcher1.get_stock_list()
     print(f"获取到 {len(stock_list)} 支股票")
     print(stock_list.head())
     
     # 测试获取单只股票数据
     test_code = "000001"
-    daily_data = fetcher.get_stock_data(test_code, period='daily')
+    daily_data = fetcher1.get_stock_data(test_code, period='daily')
     print(f"\n股票 {test_code} 日线数据:")
     print(daily_data.head())
     
-    # 测试批量获取（仅获取前5支股票用于测试）
-    test_codes = stock_list['code'].tolist()[:5]
-    batch_data = fetcher.get_batch_stock_data(test_codes, max_stocks=5, batch_size=2)
-    print(f"\n批量获取结果，成功获取 {len(batch_data)} 支股票的数据")
-    for code, data in batch_data.items():
-        print(f"股票 {code} 数据量: {len(data)} 条")
+    # 测试使用代理池
+    logger.info("\n=== 测试使用代理池 ===")
+    # 创建一个包含示例代理的列表（实际使用时需替换为真实代理）
+    test_proxies = [
+        "http://127.0.0.1:8080",
+        "http://127.0.0.1:8081"
+    ]
     
-    # 测试多周期数据获取
-    multi_period_data = fetcher.get_multi_period_data(test_codes[:3], max_stocks=3, batch_size=2)
-    print("\n多周期数据获取结果:")
-    for period, period_data in multi_period_data.items():
-        print(f"{period} 周期: 获取 {len(period_data)} 支股票的数据")
+    fetcher2 = StockDataFetcher(request_delay=(0.5, 1.5), use_proxy=True, proxy_list=test_proxies)
+    
+    try:
+        # 获取股票列表
+        proxy_stock_list = fetcher2.get_stock_list()
+        print(f"\n使用代理池获取到 {len(proxy_stock_list)} 支股票")
+    except Exception as e:
+        print(f"\n使用代理池获取股票列表失败: {str(e)}")
+    
+    # 查看代理统计信息
+    proxy_stats = fetcher2.get_proxy_stats()
+    if proxy_stats:
+        print("\n代理统计信息:")
+        for proxy, stat in proxy_stats.items():
+            if proxy:  # 跳过None
+                print(f"{proxy}: 成功 {stat['success']}，失败 {stat['failure']}，成功率 {stat.get('success_rate', 0):.2f}")

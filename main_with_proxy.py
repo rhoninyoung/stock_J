@@ -3,7 +3,7 @@
 
 """
 主控模块：协调各模块工作，实现A股KDJ指标J值筛选与邮件推送
-优化版：整合了数据获取优化、缓存机制和分批处理
+优化版：整合了数据获取优化、缓存机制、分批处理和代理池支持
 """
 
 import os
@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 import argparse
 
 # 导入自定义模块
-from data_fetcher import StockDataFetcher
+from data_fetcher_with_proxy import StockDataFetcher
 from kdj_calculator import KDJCalculator
 from stock_selector import StockSelector
 from email_sender import EmailSender
@@ -65,7 +65,10 @@ class Config:
                 'cache_dir': None,  # 缓存目录，默认为当前目录下的cache子目录
                 'request_delay': [1, 3],  # 请求延迟范围（最小值，最大值），单位为秒
                 'retry_times': 3,   # 最大重试次数
-                'retry_delay': 5    # 重试基础延迟时间
+                'retry_delay': 5,   # 重试基础延迟时间
+                'use_proxy': False,  # 是否使用代理池
+                'proxy_list': [],    # 代理列表
+                'proxy_file': None   # 代理文件路径
             }
         }
         
@@ -108,6 +111,14 @@ class Config:
         if os.environ.get('EMAIL_RECEIVER'):
             config['email']['receiver'] = os.environ.get('EMAIL_RECEIVER')
         
+        # 尝试从环境变量加载代理配置
+        if os.environ.get('USE_PROXY'):
+            config['data_fetcher']['use_proxy'] = os.environ.get('USE_PROXY').lower() == 'true'
+        if os.environ.get('PROXY_FILE'):
+            config['data_fetcher']['proxy_file'] = os.environ.get('PROXY_FILE')
+        if os.environ.get('CACHE_DIR'):
+            config['data_fetcher']['cache_dir'] = os.environ.get('CACHE_DIR')
+        
         return config
     
     def _update_dict(self, d, u):
@@ -142,7 +153,7 @@ class Config:
 
 
 class StockKDJApp:
-    """A股KDJ指标J值筛选与邮件推送应用（优化版）"""
+    """A股KDJ指标J值筛选与邮件推送应用（优化版，支持代理池）"""
     
     def __init__(self, config_file=None):
         """
@@ -158,7 +169,10 @@ class StockKDJApp:
         data_fetcher_config = self.config.get('data_fetcher')
         self.fetcher = StockDataFetcher(
             cache_dir=data_fetcher_config.get('cache_dir'),
-            request_delay=tuple(data_fetcher_config.get('request_delay', [1, 3]))
+            request_delay=tuple(data_fetcher_config.get('request_delay', [1, 3])),
+            use_proxy=data_fetcher_config.get('use_proxy', False),
+            proxy_list=data_fetcher_config.get('proxy_list', []),
+            proxy_file=data_fetcher_config.get('proxy_file')
         )
         
         # 创建KDJ计算器
@@ -281,6 +295,17 @@ class StockKDJApp:
         except Exception as e:
             logger.error(f"运行应用时出错: {str(e)}")
             return False
+    
+    def get_proxy_stats(self):
+        """
+        获取代理统计信息
+        
+        Returns:
+            dict: 代理统计信息，如果未启用代理池则返回None
+        """
+        if hasattr(self.fetcher, 'get_proxy_stats'):
+            return self.fetcher.get_proxy_stats()
+        return None
 
 
 # 云函数入口
@@ -314,6 +339,8 @@ if __name__ == "__main__":
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='A股KDJ指标J值筛选与邮件推送')
     parser.add_argument('--config', type=str, help='配置文件路径')
+    parser.add_argument('--use-proxy', action='store_true', help='启用代理池')
+    parser.add_argument('--proxy-file', type=str, help='代理文件路径')
     args = parser.parse_args()
     
     # 获取配置文件路径
@@ -322,6 +349,12 @@ if __name__ == "__main__":
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_file = os.path.join(script_dir, 'config.json')
     
+    # 如果命令行指定了代理选项，设置环境变量
+    if args.use_proxy:
+        os.environ['USE_PROXY'] = 'true'
+    if args.proxy_file:
+        os.environ['PROXY_FILE'] = args.proxy_file
+    
     # 创建并运行应用
     app = StockKDJApp(config_file)
     success = app.run()
@@ -329,5 +362,13 @@ if __name__ == "__main__":
     # 输出结果
     if success:
         logger.info("A股KDJ指标J值筛选与邮件推送成功")
+        
+        # 如果启用了代理池，输出代理统计信息
+        proxy_stats = app.get_proxy_stats()
+        if proxy_stats:
+            logger.info("代理统计信息:")
+            for proxy, stat in proxy_stats.items():
+                if proxy:  # 跳过None
+                    logger.info(f"{proxy}: 成功 {stat['success']}，失败 {stat['failure']}，成功率 {stat.get('success_rate', 0):.2f}")
     else:
         logger.error("A股KDJ指标J值筛选与邮件推送失败")

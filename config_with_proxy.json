@@ -26,6 +26,9 @@
         "cache_dir": null,
         "request_delay": [1, 3],
         "retry_times": 3,
-        "retry_delay": 5
+        "retry_delay": 5,
+        "use_proxy": false,
+        "proxy_list": [],
+        "proxy_file": null
     }
 }
